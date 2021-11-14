@@ -4,14 +4,12 @@ pip3 install requests
 
 Plasser filen nbno.py på skrivebordet.
 cd desktop
-python3 nbno.py --id digibok_0000000000000 --cover 
---f2pdf
+python3 nbno.py --id digibok_0000000000000 --cover --f2pdf
 
 
 
 ALTERNATIVT:
 Skriv inn ditt <brukernavn> i teksten under og ertatt 0000000000000 med id som du finner under "siter" eller i linken. lim så inn i terminal.
-python3 /Users/<brukernavn>/Desktop/nbno.py --id digibok_0000000000000 --cover 
-Når alle sider er lastet ned, kjør til slutt! --f2pdf
+python3 /Users/<brukernavn>/Desktop/nbno.py --id digibok_0000000000000 --cover --f2pdf
 
 
