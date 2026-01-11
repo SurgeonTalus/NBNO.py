@@ -9,6 +9,16 @@ import requests
 from pypdf import PdfWriter, PdfReader
 
 ###############################################################################
+# Settings
+###############################################################################
+contrast_factor = 1.2
+baseline_brightness = 1.2
+saturation_factor = 0.7
+target_white = 245
+max_samples = 5000
+color_threshold_pct = 0.4
+
+###############################################################################
 # Utilities
 ###############################################################################
 
@@ -23,37 +33,27 @@ def image_to_pdf_bytes(image):
     buf.seek(0)
     return buf.getvalue()
 
-def is_primarily_grayscale(image, color_threshold=0.05, tolerance=30):
-    """
-    Detect mostly grayscale pages, ignoring slight yellow/sepia tint.
-    """
+def color_percentage(image, sample_pixels=max_samples):
     if image.mode != "RGB":
         image = image.convert("RGB")
     pixels = image.getdata()
-    max_samples = 5000
-    step = max(1, len(pixels)//max_samples)
-    non_gray = 0
-    total_samples = 0
+    max_samples_local = min(sample_pixels, len(pixels))
+    step = len(pixels)//max_samples_local
+    color_pixels = 0
     for i, px in enumerate(pixels):
         if i % step != 0:
             continue
         r, g, b = px
-        # Allow yellow/brown tint as grayscale
-        if max(abs(r-g), abs(r-b), abs(g-b)) > tolerance:
-            if max(r,g,b) - min(r,g,b) > 50:
-                non_gray += 1
-        total_samples += 1
-    return (non_gray / total_samples) < color_threshold
+        if max(abs(r-g), abs(r-b), abs(g-b)) > 30 and max(r,g,b)-min(r,g,b) > 50:
+            color_pixels += 1
+    return color_pixels / max_samples_local
 
-def auto_brightness_factor(image, target_white=245, sample_pixels=5000):
-    """
-    Estimate brightness factor to make background near target_white.
-    """
+def auto_brightness_factor(image, target_white=target_white, sample_pixels=max_samples):
     if image.mode != "RGB":
         image = image.convert("RGB")
     pixels = image.getdata()
-    max_samples = min(sample_pixels, len(pixels))
-    step = len(pixels) // max_samples
+    max_samples_local = min(sample_pixels, len(pixels))
+    step = len(pixels)//max_samples_local
     brightest = 0
     for i, px in enumerate(pixels):
         if i % step != 0:
@@ -67,28 +67,21 @@ def auto_brightness_factor(image, target_white=245, sample_pixels=5000):
     factor = target_white / brightest
     return min(factor, 2.0)
 
-def enhance_grayscale_auto(image, contrast_factor=3.0, baseline_brightness=1.3, target_white=245):
-    """
-    Convert the image to true grayscale, then boost contrast and automatically
-    adjust brightness to make page background near white.
-    """
-    # Convert to true grayscale first
-    img = image.convert("L")  # 'L' mode = 8-bit grayscale
-
-    # Step 1: contrast
-    enhancer = ImageEnhance.Contrast(img)
-    img = enhancer.enhance(contrast_factor)
-
-    # Step 2: auto brightness
-    factor = auto_brightness_factor(img.convert("RGB"), target_white=target_white)
-    factor *= baseline_brightness
+def enhance_grayscale_auto(image):
+    img = image.convert("L")
+    img = ImageEnhance.Contrast(img).enhance(contrast_factor)
+    factor = auto_brightness_factor(img.convert("RGB")) * baseline_brightness
     factor = min(factor, 2.0)
+    img = ImageEnhance.Brightness(img).enhance(factor)
+    return img.convert("RGB")
 
-    enhancer = ImageEnhance.Brightness(img)
-    img = enhancer.enhance(factor)
-
-    # Convert back to RGB so PDF writer handles it consistently
-    img = img.convert("RGB")
+def enhance_color_auto(image):
+    img = image.convert("RGB")
+    img = ImageEnhance.Contrast(img).enhance(contrast_factor)
+    factor = auto_brightness_factor(img) * baseline_brightness
+    factor = min(factor, 2.0)
+    img = ImageEnhance.Brightness(img).enhance(factor)
+    img = ImageEnhance.Color(img).enhance(saturation_factor)
     return img
 
 ###############################################################################
@@ -124,7 +117,6 @@ class Book:
         r = self.session.get(url)
         r.raise_for_status()
         data = r.json()
-
         if "label" in data:
             label = data["label"]
             if isinstance(label, list):
@@ -133,7 +125,6 @@ class Book:
                 self.title = list(label.values())[0][0]
             else:
                 self.title = str(label)
-
         canvases = data["sequences"][0]["canvases"]
         for page in canvases:
             if self.media_type == "digavis":
@@ -145,16 +136,15 @@ class Book:
             self.page_names.append(name)
             self.page_data[name] = (page["width"], page["height"])
             self.page_url[name] = page["images"][0]["resource"]["service"]["@id"]
-
         self.num_pages = len(self.page_names)
         if self.media_type == "digibok":
             self.num_pages -= 5
 
     def page_grid(self, page_name):
         self.set_tile_sizes()
-        w, h = self.page_data[page_name]
-        max_col = ceil(w / self.tile_width)
-        max_row = ceil(h / self.tile_height)
+        w,h = self.page_data[page_name]
+        max_col = ceil(w/self.tile_width)
+        max_row = ceil(h/self.tile_height)
         return max_col, max_row
 
     def tile_url(self, page, col, row):
@@ -172,11 +162,9 @@ class Book:
 def download_page(page_name, book, out_path):
     if os.path.exists(out_path):
         return out_path
-
-    page_width, page_height = book.page_data[page_name]
+    w,h = book.page_data[page_name]
     max_col, max_row = book.page_grid(page_name)
-    full_page = Image.new("RGB", (page_width, page_height))
-
+    full_page = Image.new("RGB", (w,h))
     try:
         for row in range(max_row):
             for col in range(max_col):
@@ -187,7 +175,7 @@ def download_page(page_name, book, out_path):
                     r.raise_for_status()
                     with Image.open(r.raw) as tile:
                         tile.load()
-                        full_page.paste(tile, (x, y))
+                        full_page.paste(tile, (x,y))
     finally:
         full_page.save(out_path)
         full_page.close()
@@ -206,9 +194,13 @@ class IncrementalPDF:
     def build_from_images(self, images):
         for img_path in images:
             with Image.open(img_path) as img:
-                pdf_bytes = image_to_pdf_bytes(img)
-            reader = PdfReader(io.BytesIO(pdf_bytes))
-            self.writer.add_page(reader.pages[0])
+                pdf_bytes = io.BytesIO()
+                if img.mode != "RGB":
+                    img = img.convert("RGB")
+                img.save(pdf_bytes, format="PDF", resolution=100.0)
+                pdf_bytes.seek(0)
+                reader = PdfReader(pdf_bytes)
+                self.writer.add_page(reader.pages[0])
         with open(self.pdf_path, "wb") as f:
             self.writer.write(f)
 
@@ -223,73 +215,71 @@ def main():
     parser.add_argument("--stop", type=int, default=None)
     args = parser.parse_args()
 
+    # Mode choice
+    choice = input("Press 'g' for grayscale enhancement or Enter for color (-30% saturation): ").strip().lower()
+    use_grayscale = (choice=="g")
+
     media_type = "dig" + args.id.split("dig")[1].split("_")[0]
     media_id = args.id.split(media_type + "_")[1]
 
-    # Initialize book
     book = Book(media_id)
     book.set_media_type(media_type)
     book.get_manifest()
 
-    # Folder
     title = sanitize_filename(book.title) or media_id
     base_dir = os.path.join(os.path.expanduser("~/Downloads"), title)
     os.makedirs(base_dir, exist_ok=True)
 
-    # Determine last downloaded page
+    # Resume-safe
     last_downloaded_idx = -1
     for i in reversed(range(len(book.page_names))):
         img_path = os.path.join(base_dir, f"{book.page_names[i]}.jpg")
         if os.path.exists(img_path):
             last_downloaded_idx = i
             break
-
-    start_idx = max(args.start - 1, last_downloaded_idx + 1)
+    start_idx = max(args.start-1, last_downloaded_idx+1)
     stop_idx = args.stop or book.num_pages
 
-    # Download missing pages
+    # Download pages
     for i in range(start_idx, stop_idx):
         page_name = book.page_names[i]
         img_path = os.path.join(base_dir, f"{page_name}.jpg")
         download_page(page_name, book, img_path)
 
-    # Collect all downloaded images
+    # Process images
     all_images = [os.path.join(base_dir, f"{name}.jpg") for name in book.page_names if os.path.exists(os.path.join(base_dir, f"{name}.jpg"))]
 
-    # Build Color PDF
-    pdf_path = os.path.join(base_dir, f"{title}.pdf")
-    pdf = IncrementalPDF(pdf_path)
-    pdf.build_from_images(all_images)
-    print(f"📄 Color PDF ferdig: {pdf_path}")
+    # Create original PDF
+    pdf_original_path = os.path.join(base_dir, f"{title}_original.pdf")
+    pdf_original = IncrementalPDF(pdf_original_path)
+    pdf_original.build_from_images(all_images)
+    print(f"📄 Original PDF ferdig: {pdf_original_path}")
 
-    # Build enhanced grayscale PDF (_BW.pdf)
-    pdf_bw_path = os.path.join(base_dir, f"{title}_BW.pdf")
-    bw_images = []
-
+    # Create enhanced PDF
+    pdf_enhanced_path = os.path.join(base_dir, f"{title}_enhanced.pdf")
+    pdf_images = []
     for img_path in all_images:
         with Image.open(img_path) as img:
-            if is_primarily_grayscale(img):
-                img_enhanced = enhance_grayscale_auto(
-                    img,
-                    contrast_factor=3.0,
-                    baseline_brightness=1.3,
-                    target_white=245
-                )
+            if color_percentage(img) >= color_threshold_pct:
+                processed = img.copy()  # mostly color → untouched
             else:
-                img_enhanced = img.copy()
-            tmp_path = img_path + "_tmp_bw.jpg"
-            img_enhanced.save(tmp_path)
-            bw_images.append(tmp_path)
-            img_enhanced.close()
+                if use_grayscale:
+                    processed = enhance_grayscale_auto(img)
+                else:
+                    processed = enhance_color_auto(img)
+            tmp_path = img_path + "_tmp.jpg"
+            processed.save(tmp_path)
+            processed.close()
+            pdf_images.append(tmp_path)
 
-    pdf_bw = IncrementalPDF(pdf_bw_path)
-    pdf_bw.build_from_images(bw_images)
+    pdf_enhanced = IncrementalPDF(pdf_enhanced_path)
+    pdf_enhanced.build_from_images(pdf_images)
 
-    # Cleanup temporary BW files
-    for tmp in bw_images:
+    # Cleanup temp files
+    for tmp in pdf_images:
         os.remove(tmp)
 
-    print(f"📄 Enhanced Grayscale PDF (_BW) ferdig: {pdf_bw_path}")
+    print(f"📄 Enhanced PDF ferdig: {pdf_enhanced_path}")
     print("🎉 Ferdig.")
 
 if __name__ == "__main__":
